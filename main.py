@@ -51,6 +51,18 @@ MODEL_CONFIG: Dict[str, Dict] = {
     },
 }
 
+# ✅ Phase0 training_results 기준 best_threshold
+BEST_THRESHOLDS: Dict[str, float] = {
+    "ResNet18": 0.25,
+    "EfficientNet-B0": 0.15,
+    "DenseNet121": 0.18,
+}
+
+
+def get_best_threshold(model_name: str) -> float:
+    """모델별 best_threshold 반환, 없으면 0.5 사용"""
+    return BEST_THRESHOLDS.get(model_name, 0.5)
+
 # ============================================================
 # 1. 다크 + 그레이스케일(X-ray 느낌) 커스텀 CSS
 # ============================================================
@@ -148,10 +160,10 @@ section[data-testid="stSidebar"] .stFileUploader * {
 
 /* 탭 컨테이너 – 뒤에 깔린 회색 알약 배경 제거 */
 .stTabs [data-baseweb="tab-list"] {
-    border-radius: 0 !important;              /* 회색 알약 모양 제거 */
-    background-color: transparent !important; /* 배경색 제거 */
-    padding: 0 !important;                    /* 여백 제거 */
-    border: none !important;                  /* 테두리 제거 */
+    border-radius: 0 !important;
+    background-color: transparent !important;
+    padding: 0 !important;
+    border: none !important;
     box-shadow: none !important;
 }
 
@@ -174,10 +186,10 @@ section[data-testid="stSidebar"] .stFileUploader * {
 
 /* 이미지 주변 패널 – 배경/테두리 제거해서 빈 박스 없애기 */
 .xray-panel {
-    padding: 0;                     /* 내부 여백 없음 */
-    margin: 0 0 6px 0;              /* 아래 약간만 간격 */
-    border: none;                   /* 테두리 제거 */
-    background: transparent;        /* 배경 제거 */
+    padding: 0;
+    margin: 0 0 6px 0;
+    border: none;
+    background: transparent;
 }
 
 /* 패널 제목만 심플하게 남기기 */
@@ -220,14 +232,14 @@ section[data-testid="stSidebar"] .stFileUploader * {
     color: var(--text-muted);
 }
 
-/* ✅ Grad-CAM 트리거 카드 (업로더 바로 아래, 어두운 그레이 박스) */
+/* Grad-CAM 트리거 카드 */
 .gradcam-trigger-box {
-    margin-top: 0rem;              /* ⬅ 위쪽 빈 박스 제거 */
+    margin-top: 0rem;
     margin-bottom: 0.75rem;
     padding: 10px 12px;
     border-radius: 12px;
     border: 1px solid var(--border-subtle);
-    background-color: #111827;     /* ⬅ 다크 그레이 단색 (X-ray 테마) */
+    background-color: #111827;
 }
 .gradcam-trigger-title {
     font-size: 0.85rem;
@@ -276,18 +288,30 @@ st.markdown(DARK_CSS, unsafe_allow_html=True)
 def load_dicom_as_pil(file_bytes: bytes) -> Tuple[Image.Image, pydicom.Dataset]:
     """
     DICOM 바이트 → (PIL Image, DICOM Dataset)
+    학습 시 사용한 dicom_to_png와 동일한 방식:
+    - HU 변환 (RescaleSlope/Intercept)
+    - Lung window (center=40, width=800)
     """
     ds = pydicom.dcmread(io.BytesIO(file_bytes))
-    pixel_array = ds.pixel_array.astype(np.float32)
+    img = ds.pixel_array.astype(np.float32)
 
-    pixel_array -= pixel_array.min()
-    max_val = pixel_array.max()
-    if max_val > 0:
-        pixel_array /= max_val
+    # HU 변환
+    if hasattr(ds, "RescaleSlope") and hasattr(ds, "RescaleIntercept"):
+        slope = float(ds.RescaleSlope)
+        intercept = float(ds.RescaleIntercept)
+        img = img * slope + intercept
 
-    pixel_array = (pixel_array * 255.0).clip(0, 255).astype(np.uint8)
+    # Lung window 적용
+    window_center = 40.0
+    window_width = 800.0
+    min_val = window_center - window_width / 2.0
+    max_val = window_center + window_width / 2.0
 
-    pil_img = Image.fromarray(pixel_array).convert("RGB")
+    img = (img - min_val) / (max_val - min_val)
+    img = np.clip(img, 0.0, 1.0)
+    img = (img * 255.0).astype(np.uint8)
+
+    pil_img = Image.fromarray(img).convert("RGB")
     return pil_img, ds
 
 
@@ -318,13 +342,21 @@ class GradCAM:
     def _save_gradients(self, grad):
         self.gradients = grad.detach()
 
-    def __call__(self, x: torch.Tensor, target_class: int = None) -> Tuple[np.ndarray, int, float, np.ndarray]:
+    def __call__(
+        self,
+        x: torch.Tensor,
+        target_class: int = None,
+        threshold: float = 0.5,
+    ) -> Tuple[np.ndarray, int, float, np.ndarray]:
         """
         x: (1, C, H, W)
+        threshold:
+            P(Pneumonia) ≥ threshold → Pneumonia(1), else Normal(0)
+
         return:
             cam: (H, W) 0~1 float
             target_class: 0/1
-            target_prob: float
+            target_prob: float (선택된 클래스의 확률)
             logits: numpy array
         """
         self.model.zero_grad()
@@ -333,19 +365,18 @@ class GradCAM:
 
         logits = self.model(x)  # (1, C)
 
-        # 🔹 출력이 하나인 이진 모델 (logit for Pneumonia)
+        # 이진 모델 (logit for Pneumonia)
         if logits.shape[1] == 1:
             prob_pos = torch.sigmoid(logits)[0, 0]  # P(Pneumonia)
 
             if target_class is None:
-                # threshold=0.5 가정 (best_threshold와는 다를 수 있음 – 추측입니다)
-                target_class = int((prob_pos >= 0.5).item())
+                target_class = int((prob_pos >= threshold).item())
 
             score = logits[0, 0]
             probs_vec = torch.stack([1 - prob_pos, prob_pos], dim=0)
 
         else:
-            # 다중 클래스 모델일 경우 대비
+            # 다중 클래스 대비
             probs_vec = F.softmax(logits, dim=1)[0]
             if target_class is None:
                 target_class = int(torch.argmax(probs_vec).item())
@@ -454,7 +485,11 @@ def preprocess_for_model(img: Image.Image, transform: transforms.Compose) -> tor
     return x.to(DEVICE)
 
 
-def apply_colormap_on_image(gray_cam: np.ndarray, rgb_img: np.ndarray, alpha: float = 0.4) -> Tuple[np.ndarray, np.ndarray]:
+def apply_colormap_on_image(
+    gray_cam: np.ndarray,
+    rgb_img: np.ndarray,
+    alpha: float = 0.4,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     gray_cam: (H, W) 0~1
     rgb_img: (H, W, 3) uint8
@@ -498,7 +533,6 @@ uploaded_file = st.sidebar.file_uploader(
     "",
     type=["dcm", "png", "jpg", "jpeg"],
 )
-
 
 # 세션 상태로 "한 번만 눌러도 이후 자동" 플래그 관리
 if "gradcam_auto" not in st.session_state:
@@ -548,7 +582,14 @@ def run_gradcam_for_model(
     gradcam = GradCAM(model, target_layer)
 
     x = preprocess_for_model(base_img, transform)
-    cam, target_class, target_prob, logits = gradcam(x)
+
+    # ✅ 모델별 best_threshold 적용
+    best_th = get_best_threshold(model_label)
+    cam, target_class, target_prob, logits = gradcam(
+        x,
+        target_class=None,
+        threshold=best_th,
+    )
 
     rgb = np.array(base_img)
     heatmap_rgb, overlay_rgb = apply_colormap_on_image(cam, rgb, alpha=alpha)

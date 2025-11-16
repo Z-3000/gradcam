@@ -28,7 +28,7 @@ import cv2
 from PIL import Image
 
 try:
-    # 기존 DICOM 전처리 모듈이 있으면 재사용
+    # 기존 DICOM 전처리 모듈이 있으면 재사용 (현재 함수 내부에서는 사용하지 않음)
     from preprocess_core import dicom_to_pil as _dicom_to_pil_existing
     _HAS_PREPROCESS_CORE = True
 except ImportError:
@@ -71,6 +71,21 @@ MODEL_CONFIG: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# ✅ 모델별 best_threshold (training_results.json 기반)
+BEST_THRESHOLDS: Dict[str, float] = {
+    "ResNet18": 0.25,
+    "EfficientNet-B0": 0.15,
+    "DenseNet121": 0.18,
+}
+
+
+def get_best_threshold(model_name: str) -> float:
+    """
+    모델별 best_threshold 반환.
+    정의되지 않은 모델이면 기본값 0.2 사용.
+    """
+    return BEST_THRESHOLDS.get(model_name, 0.2)
+
 # ============================================================
 # 1. DICOM / 일반 이미지 로딩
 # ============================================================
@@ -78,27 +93,35 @@ MODEL_CONFIG: Dict[str, Dict[str, Any]] = {
 def dicom_to_pil(file_bytes: bytes) -> Tuple[Image.Image, Any]:
     """
     DICOM 바이트 → (PIL Image RGB, DICOM Dataset)
-    """
-    if _HAS_PREPROCESS_CORE:
-        pil_img, dcm = _dicom_to_pil_existing(file_bytes)
-        return pil_img, dcm
 
+    학습 시 사용한 dicom_to_png(window_center=40, window_width=800)와
+    동일한 방식으로 HU 변환 + 윈도우 적용 후 0~255로 스케일링.
+    """
     if pydicom is None:
         raise ImportError("pydicom 이 설치되어 있지 않습니다. pip install pydicom 필요.")
 
-    ds = pydicom.dcmread(io.BytesIO(file_bytes))
-    pixel_array = ds.pixel_array.astype(np.float32)
+    dcm = pydicom.dcmread(io.BytesIO(file_bytes))
+    img = dcm.pixel_array.astype(np.float32)
 
-    # min-max normalization → 0~255
-    pixel_array -= pixel_array.min()
-    max_val = pixel_array.max()
-    if max_val > 0:
-        pixel_array /= max_val
-    pixel_array = (pixel_array * 255.0).clip(0, 255).astype(np.uint8)
+    # 1) HU 변환 (RescaleSlope, RescaleIntercept 적용)
+    if hasattr(dcm, "RescaleSlope") and hasattr(dcm, "RescaleIntercept"):
+        slope = float(dcm.RescaleSlope)
+        intercept = float(dcm.RescaleIntercept)
+        img = img * slope + intercept
 
-    # Grayscale → RGB
-    pil_img = Image.fromarray(pixel_array).convert("RGB")
-    return pil_img, ds
+    # 2) Windowing (학습 시 사용한 파라미터와 동일)
+    window_center = 40.0
+    window_width = 800.0
+    min_val = window_center - window_width / 2.0
+    max_val = window_center + window_width / 2.0
+
+    img = (img - min_val) / (max_val - min_val)
+    img = np.clip(img, 0.0, 1.0)
+    img = (img * 255.0).astype(np.uint8)
+
+    # 3) Grayscale → RGB
+    pil_img = Image.fromarray(img).convert("RGB")
+    return pil_img, dcm
 
 
 def image_bytes_to_pil(file_bytes: bytes) -> Image.Image:
@@ -120,7 +143,7 @@ class GradCAM:
 
     사용:
         gradcam = GradCAM(model, target_layer)
-        cam, target_class, target_prob, logits = gradcam(x)
+        cam, target_class, target_prob, logits = gradcam(x, threshold=0.5)
     """
 
     def __init__(self, model: nn.Module, target_layer: nn.Module):
@@ -143,9 +166,13 @@ class GradCAM:
         self,
         x: torch.Tensor,
         target_class: Optional[int] = None,
+        threshold: float = 0.5,
     ) -> Tuple[np.ndarray, int, float, np.ndarray]:
         """
         x: (1, C, H, W) on DEVICE
+
+        threshold:
+            P(Pneumonia) ≥ threshold 이면 Pneumonia(1), 아니면 Normal(0)로 분류
 
         return:
             cam          : (H, W) [0~1] numpy
@@ -164,8 +191,8 @@ class GradCAM:
             prob_pos = torch.sigmoid(logits)[0, 0]  # P(Pneumonia)
 
             if target_class is None:
-                # 임계값 0.5 기준 (best threshold와 다를 수 있음 → 추측입니다)
-                target_class = int((prob_pos >= 0.5).item())
+                # ✅ 모델별 임계값(threshold) 기준으로 Normal / Pneumonia 결정
+                target_class = int((prob_pos >= threshold).item())
 
             # Grad-CAM은 Pneumonia logit 기준으로 계산
             score = logits[0, 0]
@@ -349,7 +376,10 @@ def run_gradcam_on_pil(
 
     gradcam = GradCAM(model, target_layer)
     x = preprocess_pil(pil_img, transform)
-    cam, t_cls, t_prob, logits = gradcam(x)
+
+    # ✅ 학습 시 계산한 best_threshold 사용
+    best_th = get_best_threshold(model_name)
+    cam, t_cls, t_prob, logits = gradcam(x, target_class=target_class, threshold=best_th)
 
     rgb = np.array(pil_img)
     heatmap_rgb, overlay_rgb = apply_colormap_on_image(cam, rgb, alpha=alpha)
