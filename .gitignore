@@ -3,7 +3,7 @@ venv/
 .env/
 
 # 체크포인트 / 큰 모델 파일
-checkpoints/*.pth
+# checkpoints/*.pth
 
 # 파이썬 캐시
 __pycache__/
