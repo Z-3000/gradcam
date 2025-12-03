@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(medical-imaging)",
+      "Bash(git fetch:*)",
+      "Bash(git reset:*)",
+      "Bash(git remote add:*)",
+      "Bash(git push:*)",
+      "Bash(mkdir:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git remote remove:*)",
+      "Bash(git remote rename:*)",
+      "Bash(git rm:*)",
+      "Bash(ls:*)",
+      "Bash(streamlit run:*)",
+      "Bash(python -m streamlit:*)",
+      "Bash(winget search:*)",
+      "Bash(winget install:*)",
+      "Bash(where:*)",
+      "Bash(C:/Users/jhson/AppData/Local/Programs/Python/Python312/python.exe:*)",
+      "Bash(./venv312/Scripts/python.exe -m pip install:*)",
+      "Bash(./venv312/Scripts/pip.exe install:*)",
+      "Bash(git remote set-url:*)",
+      "Bash(gh auth status:*)",
+      "Bash(git init:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

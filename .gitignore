@@ -1,0 +1,45 @@
+# 가상환경
+venv/
+venv312/
+.env/
+.venv/
+env/
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE/에디터
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# 로그
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 테스트/임시
+*.tmp
+*.temp
+test_images/
+outputs/
+
+# 환경변수 (API 키 등)
+.env
+.env.local
+*.env
+
+# 모델 체크포인트는 Git LFS로 관리
+# checkpoints/*.pth  # LFS 추적 중이므로 주석 처리
